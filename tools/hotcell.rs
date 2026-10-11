@@ -65,6 +65,10 @@ pub fn run(artifact: &Artifact) -> DemoResult<()> {
     let coin = load_funding(&payer_public)?;
     let builder = TxBuilder::new(artifact)?;
 
+    if let Ok(path) = std::env::var("HC_CONTINUE") {
+        return continue_mints(&builder, &payer, &payer_public, &extension, &coin, rate, mints, bump, &path, &tx_path, &out_dir);
+    }
+    let minter_owner = payer_public;
     // Genesis: one PublicMint (supply, limit 1) and one TokenSeed, same group.
     let genesis = fit_fee(rate, |fee| {
         let change = coin.entry.amount.checked_sub(2 * KAS).and_then(|v| v.checked_sub(fee)).ok_or("change")?;
@@ -97,7 +101,7 @@ pub fn run(artifact: &Artifact) -> DemoResult<()> {
     let mut minter_src: Transaction = genesis.tx.clone();
     let mut last_inputs: Option<(Transaction, Coin, i64)> = None;
     for n in 0..mints {
-        let ready = build_mint(&builder, &payer, &payer_public, &extension, &minter, &pay, remaining, rate)?;
+        let ready = build_mint(&builder, &payer, &payer_public, &minter_owner, &extension, &minter, &pay, remaining, rate)?;
         append_tx(&tx_path, "mint", &(n + 1).to_string(), &ready)?;
         if n > 0 {
             summary.push(',');
@@ -119,7 +123,7 @@ pub fn run(artifact: &Artifact) -> DemoResult<()> {
     summary.push(']');
     if let (Some(b), Some((src, c, r))) = (bump, last_inputs) {
         let m = CovenantOutput::from_tx(&src, 0)?;
-        let ready = build_mint(&builder, &payer, &payer_public, &extension, &m, &c, r, b)?;
+        let ready = build_mint(&builder, &payer, &payer_public, &minter_owner, &extension, &m, &c, r, b)?;
         append_tx(&tx_path, "bump", &mints.to_string(), &ready)?;
         summary.push_str(&format!(",\"bump\":{{\"replaces\":{mints},\"feeRate\":{b},\"fee\":{}}}", ready.fee));
     }
@@ -130,11 +134,87 @@ pub fn run(artifact: &Artifact) -> DemoResult<()> {
     Ok(())
 }
 
+/// Continue mode: mint into an existing hotcell family from its current minter output.
+/// HC_CONTINUE names a file with covenant=, txid=, index=, value=, script=, remaining=, owner= lines
+/// (owner is the minter's deposit owner, i.e. the launcher's x-only public key; the minted unit goes to HC_KEY).
+#[allow(clippy::too_many_arguments)]
+fn continue_mints(
+    builder: &TxBuilder<'_>,
+    payer: &Keypair,
+    payer_public: &[u8; 32],
+    extension: &[u8; 32],
+    coin: &Coin,
+    rate: u64,
+    mints: usize,
+    bump: Option<u64>,
+    path: &str,
+    tx_path: &str,
+    out_dir: &str,
+) -> DemoResult<()> {
+    let text = fs::read_to_string(path)?;
+    let covenant_id = kaspa_consensus_core::Hash::from_str(value_of(&text, "covenant")?)?;
+    let owner_bytes = hex_decode(value_of(&text, "owner")?)?;
+    let minter_owner: [u8; 32] = owner_bytes.as_slice().try_into().map_err(|_| "owner must be 32 bytes")?;
+    let mut remaining: i64 = value_of(&text, "remaining")?.parse()?;
+    let mut minter = CovenantOutput {
+        index: value_of(&text, "index")?.parse()?,
+        covenant_id,
+        outpoint: TransactionOutpoint::new(TransactionId::from_str(value_of(&text, "txid")?)?, value_of(&text, "index")?.parse()?),
+        utxo: UtxoEntry::new(
+            value_of(&text, "value")?.parse()?,
+            ScriptPublicKey::from_vec(0, hex_decode(value_of(&text, "script")?)?),
+            0,
+            false,
+            Some(covenant_id),
+        ),
+    };
+    let mut pay = Coin { outpoint: coin.outpoint, entry: coin.entry.clone() };
+    let mut last: Option<(CovenantOutput, Coin, i64)> = None;
+    let mut summary = format!("{{\"name\":\"hotcell\",\"mode\":\"continue\",\"covenantId\":\"{covenant_id}\",\"feeRate\":{rate},\"mints\":[");
+    for n in 0..mints {
+        if remaining < LIMIT {
+            return Err("minter exhausted".into());
+        }
+        let ready = build_mint(builder, payer, payer_public, &minter_owner, extension, &minter, &pay, remaining, rate)?;
+        append_tx(tx_path, "mint", &(n + 1).to_string(), &ready)?;
+        if n > 0 {
+            summary.push(',');
+        }
+        summary.push_str(&format!("{{\"n\":{},\"fee\":{},\"storage\":{},\"remainingAfter\":{}}}", n + 1, ready.fee, ready.storage, remaining - LIMIT));
+        last = Some((minter.clone_output(), Coin { outpoint: pay.outpoint, entry: pay.entry.clone() }, remaining));
+        minter = CovenantOutput::from_tx(&ready.tx, 0)?;
+        pay = change_coin(&ready.tx, 2)?;
+        remaining -= LIMIT;
+    }
+    summary.push(']');
+    if let (Some(b), Some((m, c, r))) = (bump, last) {
+        let ready = build_mint(builder, payer, payer_public, &minter_owner, extension, &m, &c, r, b)?;
+        append_tx(tx_path, "bump", &mints.to_string(), &ready)?;
+        summary.push_str(&format!(",\"bump\":{{\"replaces\":{mints},\"feeRate\":{b},\"fee\":{}}}", ready.fee));
+    }
+    summary.push_str("}\n");
+    fs::write(format!("{out_dir}/summary.json"), summary)?;
+    println!("covenant {covenant_id}");
+    println!("built {mints} continue-mode mints at feeRate {rate}; next minter is output 0 of the last mint");
+    Ok(())
+}
+
+trait CloneOutput {
+    fn clone_output(&self) -> CovenantOutput;
+}
+
+impl CloneOutput for CovenantOutput {
+    fn clone_output(&self) -> CovenantOutput {
+        CovenantOutput { index: self.index, covenant_id: self.covenant_id, outpoint: self.outpoint, utxo: self.utxo.clone() }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_mint(
     builder: &TxBuilder<'_>,
     payer: &Keypair,
     payer_public: &[u8; 32],
+    minter_owner: &[u8; 32],
     extension: &[u8; 32],
     minter: &CovenantOutput,
     coin: &Coin,
@@ -149,7 +229,7 @@ fn build_mint(
             &TxContext::new()
                 .actor_input(
                     "PublicMint",
-                    minter_state(remaining, payer_public, extension),
+                    minter_state(remaining, minter_owner, extension),
                     EntryCall::new("mint").args(args!(minted.clone())),
                     minter.outpoint,
                     minter.utxo.clone(),
@@ -161,7 +241,7 @@ fn build_mint(
                     InputSigScript::with_transaction(|tx, index| p2pk_signature(&sign_input(tx, index, payer))),
                     0,
                 )
-                .actor_output("PublicMint", minter_state(remaining - LIMIT, payer_public, extension), binding, minter.utxo.amount)
+                .actor_output("PublicMint", minter_state(remaining - LIMIT, minter_owner, extension), binding, minter.utxo.amount)
                 .actor_output("KCC20", minted, binding, KAS)
                 .output(p2pk(payer_public), None, change_value),
         )?;
@@ -206,8 +286,8 @@ fn load_funding(payer_public: &[u8; 32]) -> DemoResult<Coin> {
     if script.as_slice() != p2pk(payer_public).script() {
         return Err("funding script".into());
     }
-    if amount < 10 * KAS {
-        return Err("funding below 10 KAS".into());
+    if amount < 2 * KAS {
+        return Err("funding below 2 KAS".into());
     }
     Ok(Coin {
         outpoint: TransactionOutpoint::new(TransactionId::from_str(txid)?, index),
